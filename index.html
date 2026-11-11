@@ -283,7 +283,7 @@ html[data-theme=dark] .lumi-message-user .lumi-speaker{color:#bdd0ff}
           <div class="eyebrow">ACCESO AL LABORATORIO</div><h2>Identifícate para continuar</h2>
           <label>Nombre completo <input id="access-name" name="name" autocomplete="name" required maxlength="120"></label>
           <label>Correo electrónico <input id="access-email" name="email" type="email" autocomplete="email" required maxlength="254"></label>
-          <p class="access-data-note">Al entregar la evaluación, tu nombre, correo y resultado se enviarán a Google Sheets cuando haya conexión. Cada entrada como estudiante prepara un examen vacío. Los 90 minutos comienzan al confirmar su inicio.</p>
+          <p class="access-data-note">Tu nombre, correo, actividad de estudio e intentos de evaluación se enviarán a Google Sheets cuando haya conexión. Cada entrada como estudiante prepara un examen vacío. Los 90 minutos comienzan al confirmar su inicio.</p>
           <div class="access-roles" role="group" aria-label="Perfil de acceso">
             <button type="button" data-access-role="student" aria-pressed="true">Estudiante</button>
             <button type="button" data-access-role="teacher" aria-pressed="false">Docente</button>
@@ -3316,56 +3316,27 @@ global.LabGrading={validateProgram,gradeProgram,getSolutions};
   };
 })(typeof window !== 'undefined' ? window : globalThis);
 </script>
-<script>(function (global) {
+<script>
+(function (global) {
   'use strict';
 
   const document = global.document;
-  if (document?.querySelector('meta[name="codesim-sheets-mode"]')?.content !== 'direct') return;
+  if (document?.querySelector('meta[name="codesim-sheets-mode"]')?.content !== 'direct' || !global.LabOffline) return;
   const endpoint = document.querySelector('meta[name="codesim-sheets-webhook"]')?.content;
   if (!/^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(endpoint || '')) return;
 
-  const prefix = 'codesim-sheets-result-v1:';
+  const activityPrefix = 'codesim-sheets-activity-v1:';
+  const legacyPrefix = 'codesim-sheets-result-v1:';
+  const assessmentPrefix = 'codesim-sheets-assessment-v1:';
   const idPattern = /^[A-Za-z0-9_-]{1,120}$/;
-  const records = new Map();
+  const eventTypes = new Set(['study_opened', 'case_opened', 'program_run', 'case_completed']);
+  const active = new Map();
+  const pending = new Map();
+  let current = null;
   let persistent = true;
   let busy = false;
-  let confirmedHere = false;
+  let confirmed = false;
   let timer;
-
-  function validRow(row) {
-    return row && typeof row.id === 'string' && idPattern.test(row.id) &&
-      typeof row.name === 'string' && row.name.trim().length > 0 && row.name.length <= 120 &&
-      typeof row.email === 'string' && row.email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(row.email) &&
-      Number.isInteger(row.total) && row.total === 25 && Number.isInteger(row.score) && row.score >= 0 && row.score <= row.total &&
-      Number.isSafeInteger(row.startedAt) && row.startedAt > 0 && Number.isSafeInteger(row.submittedAt) && row.submittedAt >= row.startedAt &&
-      Number.isInteger(row.attemptsUsed) && row.attemptsUsed >= row.score && row.attemptsUsed <= row.total * 3;
-  }
-
-  function readSaved() {
-    try {
-      const storage = global.localStorage;
-      for (let index = 0; index < storage.length; index++) {
-        const key = storage.key(index);
-        if (!key?.startsWith(prefix)) continue;
-        const id = key.slice(prefix.length);
-        if (!idPattern.test(id)) continue;
-        const saved = storage.getItem(key);
-        if (saved === 'sent') {
-          records.set(id, null);
-        } else if (!records.has(id)) {
-          let row;
-          try { row = JSON.parse(saved); } catch { continue; }
-          if (validRow(row) && row.id === id) records.set(id, row);
-        }
-      }
-    } catch { persistent = false; }
-  }
-
-  function save(id, row) {
-    records.set(id, row);
-    try { global.localStorage.setItem(prefix + id, row ? JSON.stringify(row) : 'sent'); }
-    catch { persistent = false; }
-  }
 
   const notice = document.createElement('aside');
   notice.id = 'sheets-delivery-status';
@@ -3380,87 +3351,216 @@ global.LabGrading={validateProgram,gradeProgram,getSolutions};
   retry.style.marginInlineStart = '12px';
   notice.append(status, retry);
   document.querySelector('main')?.prepend(notice);
-
-  function render() {
-    const pending = [...records.values()].filter(Boolean).length;
-    notice.hidden = !pending && !confirmedHere;
-    retry.hidden = !pending;
-    retry.disabled = busy;
-    if (!pending) {
-      status.textContent = confirmedHere ? 'Evaluación enviada a Google Sheets.' : '';
-      return;
-    }
-    const message = pending === 1 ? 'Una evaluación pendiente de enviar a Google Sheets.' : pending + ' evaluaciones pendientes de enviar a Google Sheets.';
-    status.textContent = (busy ? 'Enviando a Google Sheets…' : message) + (!persistent ? ' Mantén el archivo abierto para reintentar el envío.' : '');
+  const accessNote = document.querySelector('.access-data-note');
+  if (accessNote) {
+    accessNote.textContent = 'Al entrar como estudiante, tu nombre, correo, actividad de estudio, ejecuciones y resultado se enviarán al registro docente en Google Sheets cuando haya conexión. Cada entrada prepara un examen vacío de 90 minutos.';
   }
 
-  async function send(row) {
+  function render() {
+    notice.hidden = !pending.size && !confirmed;
+    retry.hidden = !pending.size;
+    retry.disabled = busy;
+    if (!pending.size) {
+      status.textContent = confirmed ? 'Actividad y resultados enviados a Google Sheets.' : '';
+      return;
+    }
+    const count = pending.size === 1 ? '1 registro pendiente de envío.' : pending.size + ' registros pendientes de envío.';
+    status.textContent = (busy ? 'Enviando a Google Sheets…' : 'Google Sheets · ' + count) +
+      (!persistent ? ' Mantén esta pestaña abierta para conservar los envíos pendientes.' : '');
+  }
+
+  function read(key) {
+    try { return global.localStorage.getItem(key); }
+    catch { persistent = false; return null; }
+  }
+
+  function write(key, value) {
+    try { global.localStorage.setItem(key, value); }
+    catch { persistent = false; }
+  }
+
+  function readSaved() {
+    try {
+      const storage = global.localStorage;
+      for (let index = 0; index < storage.length; index++) {
+        const key = storage.key(index);
+        const prefix = key?.startsWith(activityPrefix) ? activityPrefix : key?.startsWith(legacyPrefix) ? legacyPrefix : null;
+        if (!prefix) continue;
+        const saved = storage.getItem(key);
+        if (saved === 'sent') pending.delete(key);
+        else if (!pending.has(key)) {
+          let row;
+          try { row = JSON.parse(saved); } catch { continue; }
+          if (row && typeof row.id === 'string' && idPattern.test(row.id) && key === prefix + row.id) pending.set(key, row);
+        }
+      }
+    } catch { persistent = false; }
+  }
+
+  function queue(identity, type, id, fields = {}, createdAt = Date.now()) {
+    const key = activityPrefix + id;
+    if (!idPattern.test(id) || pending.has(key) || read(key) === 'sent') return;
+    const row = {id, type, ...identity, ...fields, createdAt};
+    pending.set(key, row);
+    write(key, JSON.stringify(row));
+    render();
+    schedule();
+  }
+
+  async function send(payload, entries) {
     const controller = new AbortController();
     const timeout = global.setTimeout(() => controller.abort(), 15000);
     try {
-      // A string body uses text/plain and avoids a preflight from a local file.
+      // A string body uses text/plain and keeps the request compatible with Apps Script redirects.
       const response = await global.fetch(endpoint, {
         method: 'POST', credentials: 'omit', redirect: 'follow', mode: 'cors',
-        referrerPolicy: 'no-referrer', signal: controller.signal,
-        body: JSON.stringify({kind: 'codesim-offline-result-v1', row})
+        referrerPolicy: 'no-referrer', signal: controller.signal, body: JSON.stringify(payload)
       });
-      if (!response.ok) return false;
+      if (!response.ok) return 0;
       const result = await response.json();
-      return result?.ok === true && Array.isArray(result.accepted) && result.accepted.includes(row.id);
-    } catch { return false; }
+      if (result?.ok !== true || !Array.isArray(result.accepted)) return 0;
+      let count = 0;
+      const accepted = new Set(result.accepted);
+      for (const [key, row] of entries) {
+        if (!accepted.has(row.id)) continue;
+        pending.delete(key);
+        write(key, 'sent');
+        confirmed = true;
+        count++;
+      }
+      return count;
+    } catch { return 0; }
     finally { global.clearTimeout(timeout); }
+  }
+
+  function batch() {
+    const entries = [...pending].filter(([key]) => key.startsWith(activityPrefix))
+      .sort(([, a], [, b]) => a.createdAt - b.createdAt || Number(a.type === 'exam_result') - Number(b.type === 'exam_result'));
+    let length = 100;
+    let count = 0;
+    while (count < entries.length && count < 15) {
+      length += JSON.stringify(entries[count][1]).length + 1;
+      if (length > 180000 && count) break;
+      count++;
+    }
+    return entries.slice(0, count);
   }
 
   async function sync() {
     if (busy) return;
     readSaved();
-    if (global.navigator.onLine === false || ![...records.values()].some(Boolean)) {
-      render();
-      return;
-    }
+    if (global.navigator.onLine === false || !pending.size) { render(); return; }
     busy = true;
     render();
+    let stalled = false;
     try {
-      for (const [id, row] of records) {
-        if (!row) continue;
-        if (!await send(row)) break;
-        save(id, null);
-        confirmedHere = true;
+      while (true) {
+        const entries = batch();
+        if (!entries.length) break;
+        const count = await send({kind: 'codesim-activity-v1', rows: entries.map(([, row]) => row)}, entries);
+        if (!count) { stalled = true; break; }
+      }
+      for (const entry of pending) {
+        if (!entry[0].startsWith(legacyPrefix)) continue;
+        if (!await send({kind: 'codesim-offline-result-v1', row: entry[1]}, [entry])) { stalled = true; break; }
       }
     } finally {
       busy = false;
       readSaved();
       render();
+      if (pending.size) schedule(stalled ? 30000 : 0);
     }
   }
 
-  function schedule() {
-    if (timer !== undefined) return;
-    timer = global.setTimeout(() => {
-      timer = undefined;
-      void sync();
-    }, 0);
+  function schedule(delay = 0) {
+    if (timer !== undefined) {
+      if (delay) return;
+      global.clearTimeout(timer);
+    }
+    timer = global.setTimeout(() => { timer = undefined; void sync(); }, delay);
   }
 
+  function programData(program) {
+    if (!Array.isArray(program)) return {};
+    try {
+      const serialized = JSON.stringify(program);
+      return serialized.length <= 63000 ? {program: JSON.parse(serialized)} : {};
+    } catch { return {}; }
+  }
+
+  function remember(identity, attempt) {
+    if (!idPattern.test(attempt.id) || attempt.total !== 25) return;
+    active.set(attempt.id, identity.registrationId);
+    write(assessmentPrefix + attempt.id, identity.registrationId);
+    queue(identity, 'exam_start', 'start-' + attempt.id, {assessmentId: attempt.id, total: attempt.total}, attempt.deadline - 90 * 60 * 1000);
+  }
+
+  function abandon(previous) {
+    if (!previous?.assessmentId || previous.attempt?.status !== 'active') return;
+    queue(previous.identity, 'exam_abandoned', 'abandoned-' + previous.assessmentId, {assessmentId: previous.assessmentId});
+    active.delete(previous.assessmentId);
+  }
+
+  const original = global.LabOffline.request.bind(global.LabOffline);
+  global.LabOffline.request = async function (path, method = 'GET', body) {
+    const route = String(path).replace(/^\/+/, '').replace(/^api\//, '').split('?')[0];
+    const verb = String(method).toUpperCase();
+    const previous = current;
+    const event = route === 'events' && verb === 'POST' && eventTypes.has(body?.type);
+    const snapshot = previous && event && body.mode === 'study' && body.type === 'program_run' ? programData(global.App?.program) : {};
+    const started = Date.now();
+    const result = await original(path, method, body);
+    try {
+      if (route === 'session' && ['POST', 'DELETE'].includes(verb)) {
+        const user = result?.user;
+        if (verb === 'DELETE' || (user?.role === 'student' && user.email === previous?.identity.email)) abandon(previous);
+        current = user?.role === 'student' && idPattern.test(user.entryId)
+          ? {identity: {registrationId: user.entryId, name: user.name, email: user.email}} : null;
+        if (current) queue(current.identity, 'login', 'login-' + user.entryId);
+      }
+      if (!previous || previous !== current) return result;
+      const identity = current.identity;
+      if (event && (body.mode === 'study' || (body.mode === 'exam' && body.type === 'case_opened')) && idPattern.test(body.id)) {
+        const caseId = idPattern.test(body.caseId || '') ? body.caseId : undefined;
+        queue(identity, body.type, body.id, {...snapshot, ...(caseId ? {caseId} : {}),
+          ...(body.mode === 'exam' && current.assessmentId ? {assessmentId: current.assessmentId} : {}),
+          ...(body.type === 'case_completed' ? {passed: true} : {})}, started);
+      }
+      const attempt = result?.attempt;
+      if (!attempt) return result;
+      if (route === 'attempt' && verb === 'POST') remember(identity, attempt);
+      if (attempt.id !== current.assessmentId && active.get(attempt.id) !== identity.registrationId) return result;
+      current.assessmentId = attempt.id;
+      current.attempt = attempt;
+      const run = attempt.runs?.[body?.caseId];
+      if (route === 'attempt/run' && run?.executedAt >= started && Number.isInteger(run.attemptCount) && run.attemptCount >= 1 && run.attemptCount <= 3) {
+        queue(identity, 'exam_run', 'run-' + attempt.id + '-' + body.caseId + '-' + run.attemptCount, {
+          assessmentId: attempt.id, caseId: body.caseId, attemptNumber: run.attemptCount, passed: run.passed === true,
+          feedback: String(run.feedback || '').slice(0, 1000), ...programData(attempt.programs?.[body.caseId])
+        }, run.executedAt);
+      }
+    } catch { /* The simulator and its local saves remain usable if reporting fails. */ }
+    return result;
+  };
+
   global.addEventListener('codesim-exam-submitted', ({detail}) => {
-    if (!validRow(detail)) return;
-    readSaved();
-    if (records.has(detail.id)) return;
-    const {id, name, email, score, total, startedAt, submittedAt, attemptsUsed} = detail;
-    save(id, {id, name, email, score, total, startedAt, submittedAt, attemptsUsed});
-    render();
-    schedule();
+    if (!idPattern.test(detail?.id || '') || detail.total !== 25 || !Number.isInteger(detail.score)) return;
+    const registrationId = active.get(detail.id) || read(assessmentPrefix + detail.id);
+    if (!registrationId || !idPattern.test(registrationId)) return;
+    queue({registrationId, name: detail.name, email: detail.email}, 'exam_result', 'result-' + detail.id,
+      {assessmentId: detail.id, score: detail.score, total: detail.total}, detail.submittedAt);
+    active.delete(detail.id);
+    if (current?.assessmentId === detail.id && current.attempt) current.attempt.status = 'submitted';
   });
-  global.addEventListener('online', schedule);
+  document.querySelector('#offline-study-btn')?.addEventListener('click', () => { current = null; });
+  global.addEventListener('online', () => schedule());
   global.addEventListener('storage', event => {
-    if (!event.key?.startsWith(prefix)) return;
-    readSaved();
-    render();
+    if (event.key?.startsWith(activityPrefix) || event.key?.startsWith(legacyPrefix)) schedule();
   });
-  retry.addEventListener('click', schedule);
+  retry.addEventListener('click', () => schedule());
   readSaved();
   render();
-  if ([...records.values()].some(Boolean)) schedule();
+  if (pending.size) schedule();
 })(window);
 </script>
 <script>(function (global) {
